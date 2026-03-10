@@ -1,8 +1,7 @@
 """
 🗺️ لعبة الشرق الأوسط الجيوسياسية - النسخة 3.0
 """
-import logging, random, string, json, os, io, time, asyncio, pickle as _pickle
-from collections import deque as _deque
+import logging, random, string, json, os, io, time, asyncio
 from PIL import Image, ImageDraw
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
@@ -62,71 +61,8 @@ REGION_COORDS = {
 }
 AVAILABLE_REGIONS = [r for r in REGION_COORDS if r != "مصر_شمال"]
 
-# ==================== masks الخريطة الملوّنة ====================
-_MAP_SOURCE = "map_colored.png"
-_MASKS_FILE = "country_masks.pkl"
-
-# كل دولة لها لون مختلف تماماً في map_colored.png
-_COUNTRY_SEED_DATA = {
-    "ايران":    {"seed": (916,  378)},   # #00AAFF أزرق سماوي
-    "مصر":      {"seed": (154,  854)},   # #FF0000 أحمر
-    "تركيا":    {"seed": (496,  256)},   # #13D509 أخضر داكن
-    "عمان":     {"seed": (1562, 1212)},  # #FFCBA2 بيج
-    "اليمن":    {"seed": (1414, 1542)},  # #FFC107 برتقالي/ذهبي
-    "السعودية": {"seed": (784,  814)},   # #55FF00 أخضر فاتح
-    "الامارات": {"seed": (1542, 1166)},  # #FF00AA ماجنتا
-    "قطر":      {"seed": (1326, 1150)},  # #5500FF بنفسجي
-    "الكويت":   {"seed": (1126, 922)},   # #A5B9B0 رمادي-أخضر
-    "العراق":   {"seed": (890,  510)},   # #919757 زيتوني
-    "الاردن":   {"seed": (738,  748)},   # #652A14 بني داكن
-    "فلسطين":   {"seed": (594,  764)},   # #FFB9F6 وردي فاتح
-    "لبنان":    {"seed": (624,  660)},   # #FF6E00 برتقالي داكن
-    "سوريا":    {"seed": (840,  522)},   # #65145A بنفسجي داكن
-}
-
-def _compute_country_masks(colored_map_path):
-    """يحسب الـ masks باستخدام flood fill على الألوان المحددة"""
-    import numpy as np
-    img = Image.open(colored_map_path).convert("RGB")
-    arr = np.array(img)
-    H, W = arr.shape[:2]
-    masks = {}
-    for name, info in _COUNTRY_SEED_DATA.items():
-        sx, sy = info["seed"]
-        target = arr[sy, sx].astype(int)
-        visited = np.zeros((H, W), dtype=bool)
-        mask    = np.zeros((H, W), dtype=bool)
-        queue   = _deque([(sx, sy)])
-        visited[sy, sx] = True
-        while queue:
-            x, y = queue.popleft()
-            px = arr[y, x].astype(int)
-            # وقف عند الحدود السوداء
-            if px[0] < 30 and px[1] < 30 and px[2] < 30: continue
-            # وقف لو اللون بعيد (كل دولة لون مختلف تماماً)
-            if np.abs(px - target).sum() > 110: continue
-            mask[y, x] = True
-            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
-                nx, ny = x+dx, y+dy
-                if 0 <= nx < W and 0 <= ny < H and not visited[ny, nx]:
-                    visited[ny, nx] = True
-                    queue.append((nx, ny))
-        masks[name] = mask
-    return masks
-
-def _load_masks():
-    if os.path.exists(_MASKS_FILE):
-        try:
-            with open(_MASKS_FILE,"rb") as f: return _pickle.load(f)
-        except: pass
-    if os.path.exists(_MAP_SOURCE):
-        logging.info("حساب masks الخريطة...")
-        m = _compute_country_masks(_MAP_SOURCE)
-        with open(_MASKS_FILE,"wb") as f: _pickle.dump(m, f)
-        return m
-    return {}
-
-_COUNTRY_MASKS = _load_masks()
+# ==================== الخريطة تعمل بـ map_base.png فقط ====================
+_COUNTRY_MASKS = {}  # لا يوجد masks — الأعلام تُوضع بالإحداثيات
 
 # ==================== المضائق ====================
 STRAITS = {
@@ -407,6 +343,71 @@ def find_by_name(d, name):
             return uid, p
     return None, None
 
+def transfer_conquest(data, winner_uid, loser_uid):
+    """ينقل كل موارد الدولة المهزومة للمنتصر"""
+    winner_uid = str(winner_uid)
+    loser_uid  = str(loser_uid)
+    w = data["players"][winner_uid]
+    l = data["players"][loser_uid]
+
+    # ذهب
+    gold = l.get("gold", 0)
+    data["players"][winner_uid]["gold"] += gold
+    data["players"][loser_uid]["gold"]   = 0
+
+    # مزارع
+    lc  = l.get("crops", {})
+    lca = l.get("crops_amount", {})
+    wc  = w.get("crops", {})
+    wca = w.get("crops_amount", {})
+    for crop, cnt in lc.items():
+        wc[crop] = wc.get(crop, 0) + cnt
+        if crop in lca:
+            wca[crop] = lca[crop]
+    data["players"][winner_uid]["crops"]        = wc
+    data["players"][winner_uid]["crops_amount"] = wca
+    data["players"][loser_uid]["crops"]         = {}
+    data["players"][loser_uid]["crops_amount"]  = {}
+
+    # منشآت
+    lf = l.get("facilities", {})
+    wf = w.get("facilities", {})
+    for res, cnt in lf.items():
+        wf[res] = wf.get(res, 0) + cnt
+    data["players"][winner_uid]["facilities"] = wf
+    data["players"][loser_uid]["facilities"]  = {}
+
+    return gold
+
+def calc_colony_harvest(col_p):
+    """يحسب دخل مستعمرة — يُعاد استخدامه في احصد مستعمرة"""
+    region    = col_p.get("region", "")
+    preferred = REGION_PREFERRED_CROPS.get(region, [])
+    total     = 0
+    lines     = []
+    for crop, count in col_p.get("crops", {}).items():
+        fc      = FARM_CROPS.get(crop, {})
+        amt_per = col_p.get("crops_amount", {}).get(crop, fc.get("amount", 10))
+        if crop in preferred:
+            amt_per = int(amt_per * 1.5)
+        qty    = amt_per * count
+        price  = CROP_SELL_PRICE.get(crop, 20)
+        earned = qty * price
+        total += earned
+        lines.append(f"  {fc.get('emoji','🌾')} {qty}طن {crop} ← {CUR}{earned:,}")
+    for res, count in col_p.get("facilities", {}).items():
+        fc     = RESOURCE_FACILITIES.get(res, {})
+        qty    = fc.get("amount", 2) * count
+        price  = CROP_SELL_PRICE.get(res, 400)
+        earned = qty * price
+        total += earned
+        lines.append(f"  {fc.get('emoji','🏭')} {qty} {res} ← {CUR}{earned:,}")
+    terr_income = col_p.get("territories", 1) * 50
+    total += terr_income
+    return total, terr_income, lines
+
+
+
 def new_player(region, country_name, player_id):
     return {
         "country_name":country_name, "region":region,
@@ -449,78 +450,50 @@ def clean_old_requests(d):
     # مش محتاجين نمسحهم لأنهم مرتبطين بزرار تليجرام
 
 # ==================== الخريطة ====================
-def _apply_flag_on_mask(arr, flag_img, mask):
-    """يطبع العلم على شكل الدولة باستخدام الـ mask"""
-    import numpy as np
-    ys, xs = np.where(mask)
-    if len(xs) == 0: return
-    x1, y1 = int(xs.min()), int(ys.min())
-    x2, y2 = int(xs.max()), int(ys.max())
-    bw, bh = x2-x1+1, y2-y1+1
-    flag_res = flag_img.convert("RGBA").resize((bw, bh), Image.LANCZOS)
-    flag_arr = np.array(flag_res, dtype=np.float32)
-    fy_idx   = (ys - y1).astype(int)
-    fx_idx   = (xs - x1).astype(int)
-    alpha    = flag_arr[fy_idx, fx_idx, 3:4] / 255.0
-    arr[ys, xs, :3] = (
-        flag_arr[fy_idx, fx_idx, :3] * alpha +
-        arr[ys, xs, :3] * (1 - alpha)
-    ).astype(np.uint8)
-
 def generate_map(players, d):
-    import numpy as np
     img     = Image.open(MAP_FILE).convert("RGBA")
-    arr     = np.array(img, dtype=np.uint8)
+    draw    = ImageDraw.Draw(img)
     straits = get_strait_status(d)
 
     for uid, p in players.items():
         region    = p.get("region")
+        if region not in REGION_COORDS: continue
         flag_path = os.path.join(FLAGS_DIR, f"{region}.png")
-        if not os.path.exists(flag_path): continue
-        flag  = Image.open(flag_path)
         lvl   = get_level(p.get("xp", 0))
         tag   = " 🗡️" if p.get("traitor") else ""
         label = f"{lvl['emoji']}{p.get('country_name','')}{tag}"
 
-        if region in _COUNTRY_MASKS and _COUNTRY_MASKS[region].any():
-            # ===== العلم على شكل الدولة =====
-            _apply_flag_on_mask(arr, flag, _COUNTRY_MASKS[region])
-            img  = Image.fromarray(arr)
-            draw = ImageDraw.Draw(img)
-            ys, xs = _COUNTRY_MASKS[region].nonzero()
-            cx, cy = int(xs.mean()), int(ys.mean())
-            # اسم الدولة بخط أبيض مع ظل أسود
-            for ox, oy in [(-2,0),(2,0),(0,-2),(0,2)]:
-                draw.text((cx+ox, cy+oy), label, fill="black", anchor="mm")
-            draw.text((cx, cy), label, fill="white", anchor="mm")
-            arr = np.array(img, dtype=np.uint8)
-        else:
-            # ===== fallback: مستطيل صغير =====
-            if region not in REGION_COORDS: continue
-            img  = Image.fromarray(arr)
-            draw = ImageDraw.Draw(img)
-            for i, (cx, cy) in enumerate(REGION_COORDS[region]):
-                size = FLAG_SIZE_MAIN if i == 0 else FLAG_SIZE_SMALL
-                f2   = flag.convert("RGBA").resize((size, int(size*0.6)), Image.LANCZOS)
+        for i, (cx, cy) in enumerate(REGION_COORDS[region]):
+            size = FLAG_SIZE_MAIN if i == 0 else FLAG_SIZE_SMALL
+            if os.path.exists(flag_path):
+                flag = Image.open(flag_path).convert("RGBA")
+                f2   = flag.resize((size, int(size*0.6)), Image.LANCZOS)
                 fw, fh = f2.size
                 img.paste(f2, (cx-fw//2, cy-fh//2), f2)
                 draw.rectangle([cx-fw//2-2, cy-fh//2-2, cx+fw//2+2, cy+fh//2+2],
                                outline="white", width=3)
-                if i == 0:
-                    draw.text((cx, cy+fh//2+6), label, fill="black", anchor="mt")
-            arr = np.array(img, dtype=np.uint8)
+            else:
+                # بدون علم — دائرة ملوّنة
+                draw.ellipse([cx-30, cy-20, cx+30, cy+20], fill="royalblue", outline="white", width=2)
+            if i == 0:
+                # ظل أسود ثم نص أبيض
+                for ox, oy in [(-1,1),(1,1),(-1,-1),(1,-1)]:
+                    draw.text((cx+ox, cy+int(size*0.6)//2+8+oy), label, fill="black", anchor="mt")
+                draw.text((cx, cy+int(size*0.6)//2+8), label, fill="white", anchor="mt")
 
     # ===== المضائق =====
-    img  = Image.fromarray(arr)
-    draw = ImageDraw.Draw(img)
     strait_pos = {"هرمز":(1400,1050),"باب المندب":(1100,1550),"السويس":(500,950)}
     for name, pos in strait_pos.items():
         s   = straits.get(name, {})
         col = "red" if s.get("blocked") else "cyan"
         cx, cy = pos
         draw.ellipse([cx-20,cy-20,cx+20,cy+20], fill=col, outline="black", width=2)
-        draw.text((cx, cy+25), f"{'🔴' if s.get('blocked') else '🟢'}{name}",
+        for ox, oy in [(-1,1),(1,1)]:
+            draw.text((cx+ox, cy+26+oy), f"{'🔴' if s.get('blocked') else '🟢'}{name}",
+                      fill="black", anchor="mt")
+        draw.text((cx, cy+26), f"{'🔴' if s.get('blocked') else '🟢'}{name}",
                   fill="white", anchor="mt")
+
     buf = io.BytesIO()
     img.save(buf, format="PNG"); buf.seek(0)
     return buf
@@ -724,7 +697,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.caption:
         text = update.message.caption.strip()
     else:
-        text = ""
+        return  # صورة بدون كابشن — تجاهل
 
     uid   = update.effective_user.id
     uname = update.effective_user.first_name
@@ -887,7 +860,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not res_avail:
             await update.message.reply_text("❌ منطقتك مش عندها موارد صناعية. جرب *بناء مزرعة*.", parse_mode="Markdown"); return
         table = "".join(f"{RESOURCE_FACILITIES[r]['emoji']} {RESOURCE_FACILITIES[r]['name']}: {RESOURCE_FACILITIES[r]['base_cost']:,}¥ → +{RESOURCE_FACILITIES[r]['amount']} {r}/دورة\n" for r in res_avail)
-        kbd = [[InlineKeyboardButton(f"{RESOURCE_FACILITIES[r]['emoji']} {r.upper()} {RESOURCE_FACILITIES[r]['base_cost']}ذ", callback_data=f"build_{r}")] for r in res_avail]
+        kbd = [[InlineKeyboardButton(f"{RESOURCE_FACILITIES[r]['emoji']} {r.upper()} {RESOURCE_FACILITIES[r]['base_cost']}¥", callback_data=f"build_{r}")] for r in res_avail]
         kbd.append([InlineKeyboardButton("❌ الغاء", callback_data="cancel")])
         await update.message.reply_text(
             f"🏗️ *اختار المنشاة:*\n\n{table}",
@@ -909,8 +882,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cost = get_farm_cost(data, crop)
             star = "⭐" if crop in preferred else ""
             real_amt = int(fc["amount"]*1.5) if crop in preferred else fc["amount"]
-            table += f"{fc['emoji']}{star} {crop}: {cost}ذ → {real_amt}طن/حقل/دورة\n"
-            row.append(InlineKeyboardButton(f"{fc['emoji']}{star}{crop} {cost}ذ", callback_data=f"farm_{crop}"))
+            table += f"{fc['emoji']}{star} {crop}: {cost}¥ → {real_amt}طن/حقل/دورة\n"
+            row.append(InlineKeyboardButton(f"{fc['emoji']}{star}{crop} {cost}¥", callback_data=f"farm_{crop}"))
             if len(row)==2: kbd.append(row); row=[]
         if row: kbd.append(row)
         kbd.append([InlineKeyboardButton("❌ الغاء", callback_data="cancel")])
@@ -956,38 +929,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if col_left > 0:
             await update.message.reply_text(f"⏳ حصاد المستعمرة جاهز بعد *{int(col_left//60)}:{int(col_left%60):02d}*", parse_mode="Markdown"); return
         # حصاد موارد المستعمرة
-        crops_p      = col_p.get("crops",{})
-        crops_amount = col_p.get("crops_amount",{})
-        facs         = col_p.get("facilities",{})
-        region       = col_p.get("region","")
-        preferred    = REGION_PREFERRED_CROPS.get(region,[])
-        total_gold   = 0; lines = []
-        for crop, count in crops_p.items():
-            fc      = FARM_CROPS.get(crop,{})
-            amt_per = crops_amount.get(crop, fc.get("amount",10))
-            if crop in preferred: amt_per = int(amt_per*1.5)
-            qty     = amt_per * count
-            price   = CROP_SELL_PRICE.get(crop,5)
-            earned  = qty * price
-            total_gold += earned
-            lines.append(f"  {fc.get('emoji','🌾')} {qty}طن {crop} → +{earned:,}¥")
-        for res, count in facs.items():
-            fc    = RESOURCE_FACILITIES.get(res,{})
-            qty   = fc.get("amount",2)*count
-            price = CROP_SELL_PRICE.get(res,50)
-            earned= qty*price
-            total_gold += earned
-            lines.append(f"  {fc.get('emoji','🏭')} {qty} {res} → +{earned:,}¥")
-        terr_income = col_p.get("territories",1)*50
-        total_gold += terr_income
-        data["players"][str(uid)]["gold"] = p["gold"] + total_gold
+        total_gold, terr_income, prod_lines = calc_colony_harvest(col_p)
+        data["players"][str(uid)]["gold"] += total_gold
         data["players"][col_uid]["colony_last_harvest"] = time.time()
         save_data(data)
-        prod_txt = "\n".join(lines) if lines else "  لا يوجد إنتاج"
+        prod_txt = "\n".join(prod_lines) if prod_lines else "  لا يوجد إنتاج"
         await update.message.reply_text(
             f"🏴 *حصاد مستعمرة {col_p['country_name']}*\n{sep()}\n"
             f"{prod_txt}\n  🗺️ دخل الأراضي: +{terr_income:,}¥\n{sep()}\n"
-            f"💰 المضاف: *+{total_gold:,}*ذ\n💰 رصيدك: *{p['gold']+total_gold:,}*ذ",
+            f"💰 المضاف: *+{CUR}{total_gold:,}*\n"
+            f"💰 رصيدك: *{CUR}{p['gold']+total_gold:,}*",
             parse_mode="Markdown"); return
 
     # ======= تحويل محتلة → مستعمرة =======
@@ -1098,11 +1049,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ======= شراء أسلحة =======
-    if text in ["شراء اسلحة"]:
-        await update.message.reply_text("🏪 اكتب `سوق` لعرض سوق الأسلحة الكامل!", parse_mode="Markdown")
-        return
-
     if text.startswith("شراء "):
+        if text.strip() == "شراء اسلحة":
+            await update.message.reply_text("🏪 اكتب `سوق` لعرض سوق الأسلحة الكامل!", parse_mode="Markdown")
+            return
         p = get_player(data, uid)
         if not p: await update.message.reply_text("❌ مش مسجل."); return
         wid = text.replace("شراء", "").strip()
@@ -1187,30 +1137,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["players"][tuid]["country_name"] = f"{tp['country_name']} (محتلة)"
             data["players"][tuid]["occupied_by"]  = p["country_name"]
             data["players"][str(uid)]["territories"] += tp.get("territories", 1)
-            data["players"][tuid]["territories"]  = 0
-            # نقل كل الفلوس والمزارع والمنشآت
-            looted_gold = data["players"][tuid].get("gold", 0)
-            data["players"][str(uid)]["gold"] += looted_gold
-            data["players"][tuid]["gold"] = 0
-            looted_crops = data["players"][tuid].get("crops", {})
-            looted_crops_amount = data["players"][tuid].get("crops_amount", {})
-            winner_crops = data["players"][str(uid)].get("crops", {})
-            winner_crops_amount = data["players"][str(uid)].get("crops_amount", {})
-            for c, cnt in looted_crops.items():
-                winner_crops[c] = winner_crops.get(c, 0) + cnt
-                if c in looted_crops_amount:
-                    winner_crops_amount[c] = looted_crops_amount[c]
-            data["players"][str(uid)]["crops"] = winner_crops
-            data["players"][str(uid)]["crops_amount"] = winner_crops_amount
-            data["players"][tuid]["crops"] = {}
-            data["players"][tuid]["crops_amount"] = {}
-            looted_facs = data["players"][tuid].get("facilities", {})
-            winner_facs = data["players"][str(uid)].get("facilities", {})
-            for r, cnt in looted_facs.items():
-                winner_facs[r] = winner_facs.get(r, 0) + cnt
-            data["players"][str(uid)]["facilities"] = winner_facs
-            data["players"][tuid]["facilities"] = {}
-            occupied_txt = f"\n🏴 *احتللت {tp['country_name']} بالكامل!*\n💰 نهبت: {looted_gold:,}¥\n🌾 مزارعها ومنشآتها صارت لك!"
+            data["players"][tuid]["territories"]   = 0
+            looted_gold = transfer_conquest(data, uid, tuid)
+            occupied_txt = (
+                f"\n🏴 *احتللت {tp['country_name']} بالكامل!*\n"
+                f"💰 نهبت: {looted_gold:,}¥\n"
+                f"🌾 مزارعها ومنشآتها صارت لك!"
+            )
         leveled_up, new_lvl = add_xp(data, uid, 500)
         save_data(data)
         ban_txt = "\n⚠️ محظور دولياً لـ3 معارك!" if nuke_type == "قنبلة_هيدروجينية" else ""
@@ -1503,31 +1436,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data["players"][tuid]["country_name"] = f"{tp['country_name']} (محتلة)"
                 data["players"][tuid]["occupied_by"]  = p["country_name"]
                 data["players"][str(uid)]["territories"] += tp["territories"]
-                data["players"][tuid]["territories"]  = 0
-                # نقل كل الفلوس والمزارع والمنشآت للمحتل
-                looted_gold = data["players"][tuid].get("gold", 0)
-                data["players"][str(uid)]["gold"] += looted_gold
-                data["players"][tuid]["gold"] = 0
-                # نقل المزارع
-                looted_crops = data["players"][tuid].get("crops", {})
-                looted_crops_amount = data["players"][tuid].get("crops_amount", {})
-                winner_crops = data["players"][str(uid)].get("crops", {})
-                winner_crops_amount = data["players"][str(uid)].get("crops_amount", {})
-                for c, cnt in looted_crops.items():
-                    winner_crops[c] = winner_crops.get(c, 0) + cnt
-                    if c in looted_crops_amount:
-                        winner_crops_amount[c] = looted_crops_amount[c]
-                data["players"][str(uid)]["crops"] = winner_crops
-                data["players"][str(uid)]["crops_amount"] = winner_crops_amount
-                data["players"][tuid]["crops"] = {}
-                data["players"][tuid]["crops_amount"] = {}
-                # نقل المنشآت
-                looted_facs = data["players"][tuid].get("facilities", {})
-                winner_facs = data["players"][str(uid)].get("facilities", {})
-                for r, cnt in looted_facs.items():
-                    winner_facs[r] = winner_facs.get(r, 0) + cnt
-                data["players"][str(uid)]["facilities"] = winner_facs
-                data["players"][tuid]["facilities"] = {}
+                data["players"][tuid]["territories"]   = 0
+                looted_gold = transfer_conquest(data, uid, tuid)
                 conquest_txt = (
                     f"\n🏳️ *احتللت {tp['country_name']} بالكامل!*\n"
                     f"💰 نهبت: {looted_gold:,}¥\n"
@@ -1623,6 +1533,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"\n📋 *قروضك الحالية:*\n{loans_txt}"
         msg += f"\n{sep()}\n*اختار نوع القرض:*"
         await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
+        return
+
+    # ======= ديوني - التحقق من القروض وسدادها =======
+    if text in ["ديوني","قروضي","ديون","سداد"]:
+        p = get_player(data, uid)
+        if not p: await update.message.reply_text("❌ مش مسجل."); return
+        loans = p.get("loans", [])
+        if not loans:
+            await update.message.reply_text(
+                f"🏦 *ديونك*\n{sep()}\n✅ لا يوجد قروض!\nخزينتك: *{CUR}{p['gold']:,}*",
+                parse_mode="Markdown"); return
+
+        msg  = f"{box_title('🏦','ديونك وقروضك')}\n\n"
+        msg += f"💰 خزينتك الآن: *{CUR}{p['gold']:,}*\n{sep()}\n"
+        rows = []
+        total_debt = 0
+        for idx, loan in enumerate(loans):
+            due              = loan["due"]
+            remaining        = loan["remaining_cycles"]
+            total_debt      += due
+            can_afford       = p["gold"] >= due
+            urgency          = "🔴" if remaining <= 1 else ("🟡" if remaining <= 3 else "🟢")
+            afford_icon      = "✅" if can_afford else "❌"
+            msg += (
+                f"{urgency} *{loan['name']}*\n"
+                f"  💸 المبلغ الواجب: *{CUR}{due:,}*\n"
+                f"  ⏳ متبقي: *{remaining}* دورة حصاد\n"
+                f"  {afford_icon} {'تقدر تسدد' if can_afford else 'رصيد غير كافٍ'}\n"
+            )
+            if can_afford:
+                rows.append([InlineKeyboardButton(
+                    f"💳 سداد {loan['name']} — {CUR}{due:,}",
+                    callback_data=f"loan_repay_{idx}"
+                )])
+            msg += sep() + "\n"
+
+        msg += f"📊 *إجمالي الديون: {CUR}{total_debt:,}*\n"
+        if total_debt > p["gold"]:
+            msg += f"⚠️ الديون أكبر من رصيدك بـ {CUR}{total_debt - p['gold']:,}"
+        rows.append([InlineKeyboardButton("❌ إغلاق", callback_data="cancel")])
+        await update.message.reply_text(
+            msg, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
         return
 
     # ======= تحالف مع =======
@@ -2011,6 +1963,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔹 *اقتصاد:*\n`بناء مزرعة` | `بناء منشاة` | `بناء بنية تحتية`\n"
             f"`العاصمة [اسم]` | `تحويل [مبلغ] [كود]`\n"
             f"`البنك الدولي` — اقترض ذهب وسدّد من الحصاد\n"
+            f"`ديوني` — تحقق من قروضك وسدّدها مبكراً\n"
             f"💡 المحاصيل والمنشآت تُجمع مع الضرائب كل 10 دقايق\n\n"
             f"🔹 *جيش:*\n`تجنيد [عدد]` | `هجوم على [اسم]`\n\n"
             f"🔹 *الاحتلال:*\n"
@@ -2121,6 +2074,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "cancel":
         await query.edit_message_text("❌ تم الالغاء."); return
+
+    # ---- سداد مبكر للقرض ----
+    if query.data.startswith("loan_repay_"):
+        if not p: await query.edit_message_text("❌ مش مسجل."); return
+        try:
+            idx = int(query.data.replace("loan_repay_",""))
+        except:
+            await query.edit_message_text("❌ خطأ في البيانات."); return
+        loans = data["players"][str(uid)].get("loans", [])
+        if idx >= len(loans):
+            await query.edit_message_text("❌ القرض غير موجود أو سُدِّد بالفعل."); return
+        loan = loans[idx]
+        due  = loan["due"]
+        if p["gold"] < due:
+            await query.edit_message_text(
+                f"❌ *رصيد غير كافٍ!*\n{sep()}\n"
+                f"المطلوب: *{CUR}{due:,}*\n"
+                f"رصيدك:  *{CUR}{p['gold']:,}*\n"
+                f"الناقص: *{CUR}{due-p['gold']:,}*",
+                parse_mode="Markdown"); return
+        # سداد القرض
+        data["players"][str(uid)]["gold"] -= due
+        loans.pop(idx)
+        data["players"][str(uid)]["loans"] = loans
+        save_data(data)
+        remaining_loans = loans
+        extra = ""
+        if remaining_loans:
+            extra = f"\n{sep()}\n📋 *قروض متبقية: {len(remaining_loans)}*"
+            for ln in remaining_loans:
+                extra += f"\n  • {ln['name']}: {CUR}{ln['due']:,} بعد {ln['remaining_cycles']} دورة"
+        await query.edit_message_text(
+            f"✅ *تم السداد المبكر!*\n{sep()}\n"
+            f"🏦 {loan['name']}\n"
+            f"💸 سُدِّد: *{CUR}{due:,}*\n"
+            f"💰 رصيدك الآن: *{CUR}{p['gold']-due:,}*"
+            f"{extra}",
+            parse_mode="Markdown"); return
 
     # ---- القرض ----
     if query.data.startswith("loan_"):
@@ -2340,8 +2331,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_message))
+    app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.PHOTO, handle_message))
 
     loop = asyncio.get_event_loop()
     loop.create_task(disaster_loop(app))
@@ -2352,4 +2342,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
